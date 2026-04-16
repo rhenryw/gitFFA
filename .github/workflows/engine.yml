@@ -8,7 +8,7 @@ on:
     types: [submitted]
 
 jobs:
-check-and-review:
+  check-and-review:
     if: github.event_name == 'pull_request' && github.event.action != 'closed'
     runs-on: ubuntu-latest
     permissions:
@@ -132,7 +132,6 @@ check-and-review:
           pr_num    = int(os.environ['PR_NUM'])
           changed   = additions + deletions
 
-          # Load or init persistent data
           db_path = '.github/leaderboard.json'
           os.makedirs('.github', exist_ok=True)
           try:
@@ -150,7 +149,6 @@ check-and-review:
           with open(db_path, 'w') as f:
               json.dump(db, f, indent=2)
 
-          # Render LEADERBOARD.md
           ranked = sorted(db.items(), key=lambda x: x[1]['changed'], reverse=True)
           medals = ['🥇', '🥈', '🥉']
 
