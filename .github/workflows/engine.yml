@@ -1,0 +1,189 @@
+# .github/workflows/auto-merge.yml
+name: Auto Review and Merge
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, closed]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+check-and-review:
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - name: Get changed files
+        id: files
+        run: |
+          gh api /repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files \
+            --paginate | jq -r '.[].filename' > /tmp/changed_files.txt
+          cat /tmp/changed_files.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for protected paths
+        id: protection
+        run: |
+          VIOLATIONS=""
+          while IFS= read -r file; do
+            if echo "$file" | grep -qE '^(\.github/|\.gitignore$|LEADERBOARD\.md$|README\.md$|LICENSE$|protected/)'; then
+              VIOLATIONS="$VIOLATIONS\n- \`$file\`"
+            fi
+          done < /tmp/changed_files.txt
+
+          if [ -n "$VIOLATIONS" ]; then
+            echo "blocked=true" >> $GITHUB_OUTPUT
+            {
+              echo "violations<<EOF"
+              echo -e "$VIOLATIONS"
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
+          else
+            echo "blocked=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Close PR — protected files touched
+        if: steps.protection.outputs.blocked == 'true'
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body "🚫 **Auto-closed:** This PR touches protected files:
+          ${{ steps.protection.outputs.violations }}
+
+          **Protected paths:** \`.github/\`, \`.gitignore\`, \`LEADERBOARD.md\`, \`README.md\`, \`LICENSE\`, \`protected/\`
+          These files can only be changed by a maintainer." \
+            --repo ${{ github.repository }}
+          gh pr close ${{ github.event.pull_request.number }} --repo ${{ github.repository }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for mass deletions
+        if: steps.protection.outputs.blocked == 'false'
+        id: deletions
+        run: |
+          DELETIONS=${{ github.event.pull_request.deletions }}
+          if [ "$DELETIONS" -gt 500 ]; then
+            echo "blocked=true" >> $GITHUB_OUTPUT
+            echo "count=$DELETIONS" >> $GITHUB_OUTPUT
+          else
+            echo "blocked=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Close PR — mass deletions
+        if: steps.protection.outputs.blocked == 'false' && steps.deletions.outputs.blocked == 'true'
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body "🚫 **Auto-closed:** This PR deletes **${{ steps.deletions.outputs.count }} lines**, which exceeds the 500-line limit. Mass deletions require manual maintainer review." \
+            --repo ${{ github.repository }}
+          gh pr close ${{ github.event.pull_request.number }} --repo ${{ github.repository }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Request Copilot review
+        if: steps.protection.outputs.blocked == 'false' && steps.deletions.outputs.blocked == 'false'
+        run: |
+          gh api --method POST \
+            /repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/requested_reviewers \
+            -f "reviewers[]=copilot-pull-request-reviewer"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  auto-merge:
+    if: |
+      github.event_name == 'pull_request_review' &&
+      github.event.review.state == 'approved' &&
+      github.event.review.user.login == 'copilot-pull-request-reviewer'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: write
+    steps:
+      - name: Merge PR
+        run: gh pr merge "${{ github.event.pull_request.number }}" --squash --repo "${{ github.repository }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-leaderboard:
+    if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update leaderboard
+        env:
+          AUTHOR:    ${{ github.event.pull_request.user.login }}
+          ADDITIONS: ${{ github.event.pull_request.additions }}
+          DELETIONS: ${{ github.event.pull_request.deletions }}
+          PR_NUM:    ${{ github.event.pull_request.number }}
+        run: |
+          python3 << 'EOF'
+          import json, os
+
+          author    = os.environ['AUTHOR']
+          additions = int(os.environ['ADDITIONS'])
+          deletions = int(os.environ['DELETIONS'])
+          pr_num    = int(os.environ['PR_NUM'])
+          changed   = additions + deletions
+
+          # Load or init persistent data
+          db_path = '.github/leaderboard.json'
+          os.makedirs('.github', exist_ok=True)
+          try:
+              with open(db_path) as f:
+                  db = json.load(f)
+          except FileNotFoundError:
+              db = {}
+
+          entry = db.setdefault(author, {'additions': 0, 'deletions': 0, 'changed': 0, 'prs': 0})
+          entry['additions'] += additions
+          entry['deletions'] += deletions
+          entry['changed']   += changed
+          entry['prs']       += 1
+
+          with open(db_path, 'w') as f:
+              json.dump(db, f, indent=2)
+
+          # Render LEADERBOARD.md
+          ranked = sorted(db.items(), key=lambda x: x[1]['changed'], reverse=True)
+          medals = ['🥇', '🥈', '🥉']
+
+          rows = []
+          for i, (user, s) in enumerate(ranked):
+              rank = medals[i] if i < 3 else f'`#{i+1}`'
+              rows.append(
+                  f"| {rank} | [{user}](https://github.com/{user}) "
+                  f"| {s['changed']:,} | +{s['additions']:,} | -{s['deletions']:,} | {s['prs']} |"
+              )
+
+          md = '\n'.join([
+              '# 🏆 Leaderboard',
+              '',
+              'Ranked by total lines changed (additions + deletions) across all merged PRs.',
+              '',
+              '| Rank | User | Lines Changed | Additions | Deletions | PRs |',
+              '|:----:|------|-------------:|----------:|----------:|:---:|',
+              *rows,
+              '',
+              f'*Last updated by PR #{pr_num}*',
+          ]) + '\n'
+
+          with open('LEADERBOARD.md', 'w') as f:
+              f.write(md)
+
+          print(f"Updated leaderboard — {author}: +{additions}/-{deletions} ({changed} changed)")
+          EOF
+
+      - name: Commit leaderboard
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add LEADERBOARD.md .github/leaderboard.json
+          git diff --staged --quiet || git commit -m "📊 leaderboard: PR #${{ github.event.pull_request.number }} by @${{ github.event.pull_request.user.login }}"
+          git push
